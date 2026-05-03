@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { io, Socket } from "socket.io-client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -31,9 +31,9 @@ export default function WindingEngineDashboard() {
   const [configOpen, setConfigOpen] = useState(true);
   const [speedsOpen, setSpeedsOpen] = useState(true);
   
-  const [maxDepth, setMaxDepth] = useState(100);
+  const [maxDepth, setMaxDepth] = useState(2);
   const [numLevels, setNumLevels] = useState(5);
-  const [levelInterval, setLevelInterval] = useState(25);
+  const [levelInterval, setLevelInterval] = useState(0.5);
 
   const [targetLevel, setTargetLevel] = useState(5);
 
@@ -62,16 +62,21 @@ export default function WindingEngineDashboard() {
 
   // Calculate levels mathematically based on configuration
   // Equation implies L1 = 0m, L2 = interval, ... LN = Max Depth
-  const levels = Array.from({ length: numLevels }, (_, i) => i * levelInterval);
+  const levels = useMemo(() => Array.from({ length: numLevels }, (_, i) => i * levelInterval), [numLevels, levelInterval]);
 
   // Motor Speeds
-  const [hoistSpeed, setHoistSpeed] = useState(2);
-  const [lowerSpeed, setLowerSpeed] = useState(2);
-  const [retreatSpeed, setRetreatSpeed] = useState(1);
+  const [hoistSpeed, setHoistSpeed] = useState(0.8);
+  const [lowerSpeed, setLowerSpeed] = useState(0.8);
+  const [retreatSpeed, setRetreatSpeed] = useState(0.8);
 
   // Cage State
   const [currentDepth, setCurrentDepth] = useState(0);
+  const currentDepthRef = useRef(0);
+  useEffect(() => { currentDepthRef.current = currentDepth; }, [currentDepth]);
+
   const [velocity, setVelocity] = useState(0);
+  const [measSpeedCmS, setMeasSpeedCmS] = useState(0);
+  const [measDepthCm, setMeasDepthCm] = useState(0);
   const [isMoving, setIsMoving] = useState(false);
   const [emergencyStop, setEmergencyStop] = useState(false);
   const [manualState, setManualState] = useState<"hoist" | "lower" | "idle">("idle");
@@ -79,6 +84,7 @@ export default function WindingEngineDashboard() {
   // Fault State
   const [fault, setFault] = useState<"overwind" | "underwind" | null>(null);
   const [isRecovering, setIsRecovering] = useState(false);
+  const recoveryActiveRef = useRef(false);
 
   // WebSocket State
   const socketRef = useRef<Socket | null>(null);
@@ -122,8 +128,11 @@ export default function WindingEngineDashboard() {
 
   // --- WEBSOCKET CONNECTION ---
   useEffect(() => {
-    // Connect to Node.js server bridge
-    const socket = io("http://localhost:3001");
+    // Connect to Node.js server bridge, forcing websockets to prevent polling/eval CSP issues
+    const socket = io("http://localhost:3001", {
+      transports: ["websocket"],
+      upgrade: false
+    });
     socketRef.current = socket;
 
     socket.on("connect", () => {
@@ -143,7 +152,17 @@ export default function WindingEngineDashboard() {
       if (payload.velocity !== undefined) {
         setVelocity(Number(payload.velocity));
       }
-      if (payload.fault !== undefined) {
+      if (payload.measSpeedCmS !== undefined) {
+        setMeasSpeedCmS(Number(payload.measSpeedCmS));
+      }
+      if (payload.measDepthCm !== undefined) {
+        setMeasDepthCm(Number(payload.measDepthCm));
+      }
+      if (payload.topFault === "true") {
+        setFault(prev => prev !== "overwind" ? "overwind" : prev);
+      } else if (payload.botFault === "true") {
+        setFault(prev => prev !== "underwind" ? "underwind" : prev);
+      } else if (payload.fault !== undefined) {
         setFault(payload.fault === "none" ? null : payload.fault);
       }
     });
@@ -185,11 +204,13 @@ export default function WindingEngineDashboard() {
           // Boundary checks
           if (direction === "up" && newDepth <= 0) {
             stopCage();
+            socketRef.current?.emit("command", { action: "stop" });
             if (prev > 0) addLog("info", "Cage arrived at SURFACE level.");
             return 0;
           }
           if (direction === "down" && newDepth >= lowerLimit) {
             stopCage();
+            socketRef.current?.emit("command", { action: "stop" });
             if (prev < lowerLimit) addLog("info", `Cage arrived at TARGET depth (${lowerLimit.toFixed(1)}m).`);
             return lowerLimit;
           }
@@ -242,6 +263,7 @@ export default function WindingEngineDashboard() {
       autoTimeoutRef.current = null;
     }
     socketRef.current?.emit("command", { action: "estop" });
+    socketRef.current?.emit("command", { action: "fault_state", state: false });
     addLog("error", "!!! EMERGENCY STOP ACTIVATED !!! - All operations halted");
   };
 
@@ -315,79 +337,116 @@ export default function WindingEngineDashboard() {
     socketRef.current?.emit("command", { action: "lower", speed: Math.min(lowerSpeed * 50, 255) });
   };
 
-  // Multi-Stage Async Fault Simulation Loops
-  const triggerFaultSimulation = async (type: "overwind" | "underwind") => {
+  // Unified Fault Recovery Sequence (Triggered by hardware telemetry OR software simulation)
+  useEffect(() => {
+    if (fault === "overwind" || fault === "underwind") {
+      if (recoveryActiveRef.current) return;
+      recoveryActiveRef.current = true;
+      
+      const runRecovery = async () => {
+        setIsRecovering(true);
+        stopCage();
+        setIsAutoCycleRunning(false);
+        if (autoTimeoutRef.current) { clearTimeout(autoTimeoutRef.current); autoTimeoutRef.current = null; }
+        
+        setVelocity(0);
+        socketRef.current?.emit("command", { action: "fault_state", state: true });
+        addLog("error", `!!! ${fault.toUpperCase()} FAULT DETECTED !!! - Cage breached safety boundaries.`);
+        addLog("warning", "Catastrophic braking engaged. Suspending operation...");
+        
+        await new Promise(r => setTimeout(r, 2000));
+        
+        addLog("info", "Initiating Autonomous Recovery sequence...");
+        
+        let targetDepth = 0;
+        if (fault === "overwind") {
+            const nextLevel = levels.find(l => l > currentDepthRef.current + 0.1);
+            targetDepth = nextLevel !== undefined ? nextLevel : levelInterval;
+        } else {
+            const prevLevel = [...levels].reverse().find(l => l < currentDepthRef.current - 0.1);
+            targetDepth = prevLevel !== undefined ? prevLevel : (maxDepth - levelInterval);
+        }
+        
+        const recoveryDirection = fault === "overwind" ? "down" : "up";
+        setVelocity(recoveryDirection === "down" ? retreatSpeed : -retreatSpeed);
+        
+        socketRef.current?.emit("command", { 
+            action: recoveryDirection === "down" ? "lower" : "hoist", 
+            speed: Math.min(retreatSpeed * 50, 255) 
+        });
+        
+        await new Promise<void>(resolve => {
+          const recoveryInterval = setInterval(() => {
+            setCurrentDepth(prev => {
+              const increment = recoveryDirection === "down" ? retreatSpeed * 0.05 : -(retreatSpeed * 0.05);
+              const newDepth = prev + increment;
+              
+              if ((recoveryDirection === "down" && newDepth >= targetDepth) || (recoveryDirection === "up" && newDepth <= targetDepth)) {
+                clearInterval(recoveryInterval);
+                resolve();
+                return targetDepth; // precisely clamp to safe level
+              }
+              return newDepth;
+            });
+          }, 50);
+        });
+        
+        // Stabilized
+        socketRef.current?.emit("command", { action: "stop" });
+        socketRef.current?.emit("command", { action: "fault_state", state: false });
+        setVelocity(0);
+        setFault(null);
+        setIsRecovering(false);
+        recoveryActiveRef.current = false;
+        addLog("success", `System stabilized at L${levels.indexOf(targetDepth) + 1} (${targetDepth.toFixed(1)}m). Fault cleared.`);
+      };
+      
+      runRecovery();
+    }
+  }, [fault, levels, levelInterval, maxDepth, retreatSpeed, addLog, stopCage]);
+
+  // Software Fallback Crash Simulator
+  const simulateFault = (type: "overwind" | "underwind") => {
     if (emergencyStop || fault || isRecovering) return;
-    
     stopCage();
     setIsAutoCycleRunning(false);
-    
-    // Phase 1: Drive to Fault (Animated)
     setIsRecovering(true); // Lock manual controls
+    
     addLog("warning", `Simulating ${type.toUpperCase()}... Loss of control!`);
     
-    const faultDepth = type === "overwind" ? -5 : maxDepth + 5;
     const runawayDirection = type === "overwind" ? "up" : "down";
     const runawaySpeed = type === "overwind" ? hoistSpeed : lowerSpeed;
+    const faultDepth = type === "overwind" ? -0.25 : maxDepth + 0.25;
+    
+    socketRef.current?.emit("command", { 
+        action: runawayDirection === "down" ? "lower" : "hoist", 
+        speed: Math.min(runawaySpeed * 50, 255) 
+    });
+    
     setVelocity(runawayDirection === "down" ? runawaySpeed : -runawaySpeed);
-
-    await new Promise<void>(resolve => {
-      const driveInterval = setInterval(() => {
-        setCurrentDepth(prev => {
-          const increment = runawayDirection === "down" ? runawaySpeed * 0.05 : -(runawaySpeed * 0.05);
-          const newDepth = prev + increment;
+    
+    const driveInterval = setInterval(() => {
+      setCurrentDepth(prev => {
+        const increment = runawayDirection === "down" ? runawaySpeed * 0.05 : -(runawaySpeed * 0.05);
+        const newDepth = prev + increment;
+        
+        if ((runawayDirection === "down" && newDepth >= faultDepth) || (runawayDirection === "up" && newDepth <= faultDepth)) {
+          clearInterval(driveInterval);
+          socketRef.current?.emit("command", { action: "stop" }); // Actually stop the runaway motor
           
-          if ((runawayDirection === "down" && newDepth >= faultDepth) || (runawayDirection === "up" && newDepth <= faultDepth)) {
-            clearInterval(driveInterval);
-            resolve();
-            return faultDepth; // snap to exact limit
-          }
-          return newDepth;
-        });
-      }, 50);
-    });
-
-    // Phase 2: The Crash (Pause & Alarm)
-    setVelocity(0);
-    setFault(type); // Triggers visual red alarms across UI
+          // If hardware didn't trigger fault via telemetry, software forces it here
+          setFault(type);
+          return faultDepth;
+        }
+        return newDepth;
+      });
+    }, 50);
     
-    addLog("error", `!!! ${type.toUpperCase()} FAULT DETECTED !!! - Cage breached safety boundaries.`);
-    addLog("warning", "Catastrophic braking engaged. Suspending operation...");
-    
-    await new Promise(r => setTimeout(r, 2000));
-    
-    // Phase 3: The Retreat (Animated)
-    addLog("info", "Initiating Autonomous Recovery sequence...");
-    
-    const targetDepth = type === "overwind" ? 0 : maxDepth;
-    const recoveryDirection = type === "overwind" ? "down" : "up";
-    setVelocity(recoveryDirection === "down" ? retreatSpeed : -retreatSpeed);
-    
-    await new Promise<void>(resolve => {
-      const recoveryInterval = setInterval(() => {
-        setCurrentDepth(prev => {
-          const increment = recoveryDirection === "down" ? retreatSpeed * 0.05 : -(retreatSpeed * 0.05);
-          const newDepth = prev + increment;
-          
-          if ((recoveryDirection === "down" && newDepth >= targetDepth) || (recoveryDirection === "up" && newDepth <= targetDepth)) {
-            clearInterval(recoveryInterval);
-            resolve();
-            return targetDepth; // precisely clamp to safe level
-          }
-          return newDepth;
-        });
-      }, 50);
-    });
-    
-    // Release
-    setVelocity(0);
-    setFault(null);
-    setIsRecovering(false);
-    addLog("success", "System stabilized at nearest safe level. Fault cleared.");
+    animationRef.current = driveInterval; 
   };
 
-  const simulateOverWind = () => triggerFaultSimulation("overwind");
-  const simulateUnderWind = () => triggerFaultSimulation("underwind");
+  const simulateOverWind = () => simulateFault("overwind");
+  const simulateUnderWind = () => simulateFault("underwind");
 
   // Save Config
   const handleSaveConfig = () => {
@@ -515,8 +574,8 @@ export default function WindingEngineDashboard() {
                         value={maxDepth}
                         onChange={(e) => handleMaxDepthChange(Number(e.target.value))}
                         className="font-mono bg-slate-900 border-slate-700"
-                        min={10}
-                        step={1}
+                        min={1}
+                        step={0.5}
                       />
                     </div>
                     <div className="space-y-2">
@@ -528,8 +587,8 @@ export default function WindingEngineDashboard() {
                         value={levelInterval}
                         onChange={(e) => handleLevelIntervalChange(Number(e.target.value))}
                         className="font-mono bg-slate-900 border-slate-700"
-                        min={1}
-                        step={0.5}
+                        min={0.1}
+                        step={0.1}
                       />
                     </div>
                     <div className="space-y-2">
@@ -650,13 +709,13 @@ export default function WindingEngineDashboard() {
               <div className="grid grid-cols-2 gap-4">
                 <div className="bg-slate-900 border border-border rounded-sm p-3">
                   <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1 font-mono">
-                    Current Depth
+                    Est. Depth
                   </div>
                   <div className={cn("text-2xl font-mono font-bold tabular-nums", fault ? "text-neon-red" : "text-neon-green")}>
-                    {currentDepth.toFixed(2)}m
+                    {currentDepth.toFixed(2)} m
                   </div>
                   <div className="text-xs text-muted-foreground font-mono">
-                    of {maxDepth.toFixed(1)}m max
+                    of {maxDepth.toFixed(1)} m max
                   </div>
                 </div>
                 <div className="bg-slate-900 border border-border rounded-sm p-3">
@@ -680,12 +739,34 @@ export default function WindingEngineDashboard() {
                     {velocity > 0 ? "LOWERING" : velocity < 0 ? "HOISTING" : "STOPPED"}
                   </div>
                 </div>
+                <div className="bg-slate-900 border border-cyan-900/50 rounded-sm p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-cyan-500 mb-1 font-mono">
+                    Measured Depth
+                  </div>
+                  <div className="text-2xl font-mono font-bold tabular-nums text-cyan-400">
+                    {measDepthCm.toFixed(2)} m
+                  </div>
+                  <div className="text-xs text-cyan-700 font-mono">
+                    Hardware Sensor
+                  </div>
+                </div>
+                <div className="bg-slate-900 border border-cyan-900/50 rounded-sm p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-cyan-500 mb-1 font-mono">
+                    Measured Speed
+                  </div>
+                  <div className="text-2xl font-mono font-bold tabular-nums text-cyan-400">
+                    {measSpeedCmS.toFixed(2)} m/s
+                  </div>
+                  <div className="text-xs text-cyan-700 font-mono">
+                    Hardware Sensor
+                  </div>
+                </div>
               </div>
 
               {/* Graphical Mine Shaft Visual */}
-              <div className="relative flex-1 min-h-[400px] mt-2 border-t-2 border-dashed border-slate-800 pt-8 pb-8">
+              <div className="relative flex-1 min-h-[400px] mt-2 border-t-2 border-dashed border-slate-800 pt-8 pb-8 overflow-hidden">
                 {/* Shaft Track Background */}
-                <div className="absolute inset-y-4 inset-x-0 mx-auto w-32 flex justify-center">
+                <div className="absolute top-24 bottom-12 inset-x-0 mx-auto w-32 flex justify-center">
                   {/* Left Rail */}
                   <div className="w-3 bg-gradient-to-b from-slate-600 via-slate-700 to-slate-800 rounded-t-sm shadow-inner" />
 

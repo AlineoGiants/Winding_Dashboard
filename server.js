@@ -6,7 +6,7 @@ const { ReadlineParser } = require('@serialport/parser-readline');
 const cors = require('cors');
 
 // --- 1. SYSTEM CONFIGURATION ---
-const ARDUINO_COM_PORT = 'COM3'; // <-- You will change this to match your Windows COM port
+const ARDUINO_COM_PORT = 'COM7'; // <-- You will change this to match your Windows COM port
 const BAUD_RATE = 9600;
 const SERVER_PORT = 3001; // Runs on 3001 so it doesn't fight with your Next.js UI on 3000
 
@@ -44,10 +44,27 @@ parser.on('data', (data) => {
 io.on('connection', (socket) => {
   console.log('[+] Dashboard connected to Node.js Bridge');
 
-  socket.on('command', (cmd) => {
-    console.log('Sending command to hardware:', cmd);
-    // Send the JSON command down the USB cable to the Arduino
-    port.write(JSON.stringify(cmd) + '\n');
+  // --- THE MISSING BRIDGE ---
+  // Listen for the 'command' event from the Next.js frontend
+  socket.on('command', (data) => {
+    // 1. Print it to the terminal so you know the server caught it
+    console.log("SERVER CAUGHT COMMAND:", data);
+
+    // 2. Convert the JSON object to a string and ADD THE CRITICAL NEWLINE (\n)
+    const commandString = JSON.stringify(data) + '\n';
+
+    // 3. Push it down the USB cable
+    if (port.isOpen) {
+      port.write(commandString, (err) => {
+        if (err) {
+          console.error('Failed to write to Arduino:', err.message);
+        } else {
+          console.log('Command successfully sent to USB');
+        }
+      });
+    } else {
+      console.log('ERROR: USB Port is closed. Cannot send command.');
+    }
   });
 });
 

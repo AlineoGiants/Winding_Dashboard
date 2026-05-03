@@ -84,7 +84,7 @@ export function TelemetryLog({ logs, className }: TelemetryLogProps) {
           ) : (
             logs.map((log) => (
               <div key={log.id} className="flex gap-2">
-                <span className="text-slate-600 shrink-0">
+                <span className="text-slate-600 shrink-0" suppressHydrationWarning>
                   {log.timestamp.toLocaleTimeString("en-US", {
                     hour12: false,
                     hour: "2-digit",
