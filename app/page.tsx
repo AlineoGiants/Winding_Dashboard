@@ -85,6 +85,7 @@ export default function WindingEngineDashboard() {
   const [fault, setFault] = useState<"overwind" | "underwind" | null>(null);
   const [isRecovering, setIsRecovering] = useState(false);
   const recoveryActiveRef = useRef(false);
+  const faultSourceRef = useRef<"physical" | "simulated" | null>(null);
 
   // WebSocket State
   const socketRef = useRef<Socket | null>(null);
@@ -158,12 +159,18 @@ export default function WindingEngineDashboard() {
       if (payload.measDepthCm !== undefined) {
         setMeasDepthCm(Number(payload.measDepthCm));
       }
-      if (payload.topFault === "true") {
+      if (payload.topFault === "true" || payload.topFault === true) {
+        faultSourceRef.current = "physical";
         setFault(prev => prev !== "overwind" ? "overwind" : prev);
-      } else if (payload.botFault === "true") {
+      } else if (payload.botFault === "true" || payload.botFault === true) {
+        faultSourceRef.current = "physical";
         setFault(prev => prev !== "underwind" ? "underwind" : prev);
-      } else if (payload.fault !== undefined) {
-        setFault(payload.fault === "none" ? null : payload.fault);
+      } else {
+        // Clear physical faults when both sensors are reading normal
+        if (faultSourceRef.current === "physical") {
+          setFault(null);
+          faultSourceRef.current = null;
+        }
       }
     });
 
@@ -186,7 +193,9 @@ export default function WindingEngineDashboard() {
   // Movement function
   const moveCage = useCallback(
     (direction: "up" | "down", limit?: number) => {
-      if (emergencyStop || fault || isRecovering) return;
+      if (emergencyStop || isRecovering) return;
+      if (direction === "up" && fault === "overwind") return;
+      if (direction === "down" && fault === "underwind") return;
 
       setIsMoving(true);
       const speed = direction === "down" ? lowerSpeed : hoistSpeed;
@@ -224,7 +233,8 @@ export default function WindingEngineDashboard() {
 
   // Latching Manual Control Handlers
   const handleHoistToggle = () => {
-    if (emergencyStop || fault || isRecovering || isAutonomous) return;
+    if (emergencyStop || isRecovering || isAutonomous) return;
+    if (fault === "overwind") return;
     if (manualState === "hoist") {
       addLog("info", "Manual HOIST stopped.");
       socketRef.current?.emit("command", { action: "stop" });
@@ -239,7 +249,8 @@ export default function WindingEngineDashboard() {
   };
 
   const handleLowerToggle = () => {
-    if (emergencyStop || fault || isRecovering || isAutonomous) return;
+    if (emergencyStop || isRecovering || isAutonomous) return;
+    if (fault === "underwind") return;
     if (manualState === "lower") {
       addLog("info", "Manual LOWER stopped.");
       socketRef.current?.emit("command", { action: "stop" });
@@ -273,6 +284,9 @@ export default function WindingEngineDashboard() {
       return;
     }
     setEmergencyStop(false);
+    setFault(null);
+    faultSourceRef.current = null;
+    socketRef.current?.emit("command", { action: "fault_state", state: false });
     addLog("success", "Emergency stop reset - System ready");
   };
 
@@ -337,35 +351,45 @@ export default function WindingEngineDashboard() {
     socketRef.current?.emit("command", { action: "lower", speed: Math.min(lowerSpeed * 50, 255) });
   };
 
-  // Unified Fault Recovery Sequence (Triggered by hardware telemetry OR software simulation)
+  // Unified Fault Handling Sequence (Triggered by hardware telemetry OR software simulation)
   useEffect(() => {
     if (fault === "overwind" || fault === "underwind") {
       if (recoveryActiveRef.current) return;
       recoveryActiveRef.current = true;
       
-      const runRecovery = async () => {
+      const handleFault = async () => {
         setIsRecovering(true);
         stopCage();
         setIsAutoCycleRunning(false);
         if (autoTimeoutRef.current) { clearTimeout(autoTimeoutRef.current); autoTimeoutRef.current = null; }
         
         setVelocity(0);
-        socketRef.current?.emit("command", { action: "fault_state", state: true });
         addLog("error", `!!! ${fault.toUpperCase()} FAULT DETECTED !!! - Cage breached safety boundaries.`);
-        addLog("warning", "Catastrophic braking engaged. Suspending operation...");
         
-        await new Promise(r => setTimeout(r, 2000));
+        if (faultSourceRef.current === "physical") {
+          addLog("warning", "Catastrophic braking engaged. Motion stopped due to physical sensor.");
+          socketRef.current?.emit("command", { action: "stop" });
+          setIsRecovering(false);
+          recoveryActiveRef.current = false;
+          return;
+        }
+
+        socketRef.current?.emit("command", { action: "fault_state", state: true });
         
-        addLog("info", "Initiating Autonomous Recovery sequence...");
+        addLog("warning", "Catastrophic braking engaged. Initiating autonomous recovery...");
         
         let targetDepth = 0;
         if (fault === "overwind") {
-            const nextLevel = levels.find(l => l > currentDepthRef.current + 0.1);
-            targetDepth = nextLevel !== undefined ? nextLevel : levelInterval;
+            targetDepth = levels[0];
+            socketRef.current?.emit("command", { action: "calibrate", depth: currentDepthRef.current * 100 });
         } else {
-            const prevLevel = [...levels].reverse().find(l => l < currentDepthRef.current - 0.1);
-            targetDepth = prevLevel !== undefined ? prevLevel : (maxDepth - levelInterval);
+            targetDepth = maxDepth;
+            socketRef.current?.emit("command", { action: "calibrate", depth: currentDepthRef.current * 100 });
         }
+        
+        // Temporarily halt motion for 3 seconds before retreating
+        addLog("info", "System halted. Waiting 3 seconds before recovery...");
+        await new Promise(resolve => setTimeout(resolve, 3000));
         
         const recoveryDirection = fault === "overwind" ? "down" : "up";
         setVelocity(recoveryDirection === "down" ? retreatSpeed : -retreatSpeed);
@@ -401,7 +425,7 @@ export default function WindingEngineDashboard() {
         addLog("success", `System stabilized at L${levels.indexOf(targetDepth) + 1} (${targetDepth.toFixed(1)}m). Fault cleared.`);
       };
       
-      runRecovery();
+      handleFault();
     }
   }, [fault, levels, levelInterval, maxDepth, retreatSpeed, addLog, stopCage]);
 
@@ -413,6 +437,7 @@ export default function WindingEngineDashboard() {
     setIsRecovering(true); // Lock manual controls
     
     addLog("warning", `Simulating ${type.toUpperCase()}... Loss of control!`);
+    socketRef.current?.emit("command", { action: "fault_state", state: true });
     
     const runawayDirection = type === "overwind" ? "up" : "down";
     const runawaySpeed = type === "overwind" ? hoistSpeed : lowerSpeed;
@@ -435,6 +460,7 @@ export default function WindingEngineDashboard() {
           socketRef.current?.emit("command", { action: "stop" }); // Actually stop the runaway motor
           
           // If hardware didn't trigger fault via telemetry, software forces it here
+          faultSourceRef.current = "simulated";
           setFault(type);
           return faultDepth;
         }

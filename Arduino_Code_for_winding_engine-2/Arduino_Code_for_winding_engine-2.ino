@@ -1,27 +1,29 @@
 // --- MINE WINDING ENGINE: MASTER SCADA FIRMWARE (V3.0) ---
-// Features: JSON Telemetry, VFD PWM Control, Hardware Interrupts, Kinematic Math
+// Features: JSON Telemetry, VFD PWM Control, Hardware Interrupts, Kinematic
+// Math
 
 #include <ArduinoJson.h>
 
 // --- 1. HARDWARE PIN DEFINITIONS ---
-const int ENCODER_PIN = 2; // LM393 D0 Pin (MUST be Pin 2 for Hardware Interrupt)
-const int TOP_SENSOR = 4;  // Top limit switch
-const int BOT_SENSOR = 5;  // Bottom limit switch
-const int BUZZER = 6;      // Active buzzer for alarms
-const int IN1_PIN = 8;     // L298N Direction 1
-const int IN2_PIN = 9;     // L298N Direction 2
-const int ENA_PIN = 10;    // L298N PWM Speed Control
+const int ENCODER_PIN =
+    2;                    // LM393 D0 Pin (MUST be Pin 2 for Hardware Interrupt)
+const int TOP_SENSOR = 4; // Top limit switch
+const int BOT_SENSOR = 5; // Bottom limit switch
+const int BUZZER = 6;     // Active buzzer for alarms
+const int IN1_PIN = 8;    // L298N Direction 1
+const int IN2_PIN = 9;    // L298N Direction 2
+const int ENA_PIN = 10;   // L298N PWM Speed Control
 
 // --- 2. KINEMATIC CONSTANTS ---
 // Update these to match your exact physical wheel!
-const float WHEEL_CIRCUMFERENCE_CM = 15.0; // Distance around the winding drum
-const int ENCODER_SLOTS = 20;              // Holes on your black encoder disk
+const float WHEEL_CIRCUMFERENCE_CM = 0.45; // Distance around the winding drum
+const int ENCODER_SLOTS = 20;             // Holes on your black encoder disk
 const float CM_PER_PULSE = WHEEL_CIRCUMFERENCE_CM / ENCODER_SLOTS;
 
 // --- 3. SYSTEM STATE VARIABLES ---
 volatile long absolutePulses = 0; // Truly independent, counts every movement
 volatile long depthPulses = 0;    // Guesses direction based on motor state
-String motorState = "IDLE";      
+String motorState = "IDLE";
 bool topFault = false;
 bool botFault = false;
 bool softwareFault = false;
@@ -42,7 +44,7 @@ bool alarmActive = false;
 
 void setup() {
   Serial.begin(9600);
-  
+
   // Initialize Pins
   pinMode(ENCODER_PIN, INPUT_PULLUP);
   pinMode(TOP_SENSOR, INPUT_PULLUP);
@@ -54,7 +56,7 @@ void setup() {
 
   // Attach high-speed hardware interrupt for the optical encoder
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), countPulse, FALLING);
-  
+
   // Ensure motor starts off
   stopMotor();
 }
@@ -77,7 +79,7 @@ void loop() {
 
   // Unified Continuous Alarm for ANY fault (Physical or Software)
   bool isFaultActive = topFault || botFault || softwareFault;
-  
+
   if (isFaultActive && !alarmActive) {
     triggerAlarm();
     alarmActive = true;
@@ -86,63 +88,65 @@ void loop() {
     alarmActive = false;
   }
 
-// --- PHASE 2: CALCULATE KINEMATICS (SPEED & DISTANCE) ---
-  
-  // ATOMIC READ: Safely copy the volatile variables 
+  // --- PHASE 2: CALCULATE KINEMATICS (SPEED & DISTANCE) ---
+
+  // ATOMIC READ: Safely copy the volatile variables
   // so the interrupt doesn't scramble them while we do math.
   long safeAbsolutePulses;
   long safeDepthPulses;
-  
+
   noInterrupts(); // Pause interrupts
   safeAbsolutePulses = absolutePulses;
   safeDepthPulses = depthPulses;
-  interrupts();   // Resume interrupts immediately
+  interrupts(); // Resume interrupts immediately
 
   // Calculate Depth and Absolute Distance using the safe copies
   measuredDepthCm = safeDepthPulses * CM_PER_PULSE;
-  float absoluteDistanceCm = safeAbsolutePulses * CM_PER_PULSE; 
+  float absoluteDistanceCm = safeAbsolutePulses * CM_PER_PULSE;
 
   // Calculate speed based on the absolute (true) movement
-  if (currentTime - lastSpeedCalcTime >= 200) { 
+  if (currentTime - lastSpeedCalcTime >= 200) {
     long pulseDifference = abs(safeAbsolutePulses - lastSpeedPulses);
     float distanceMoved = pulseDifference * CM_PER_PULSE;
-    
-    measuredSpeedCmS = distanceMoved / ((currentTime - lastSpeedCalcTime) / 1000.0);
-    
+
+    measuredSpeedCmS =
+        distanceMoved / ((currentTime - lastSpeedCalcTime) / 1000.0);
+
     lastSpeedPulses = safeAbsolutePulses;
     lastSpeedCalcTime = currentTime;
   }
 
-  
   // --- PHASE 3: INCOMING NETWORK COMMANDS ---
   // Listen for JSON commands from the Node.js Server
   if (Serial.available() > 0) {
     String incomingCommand = Serial.readStringUntil('\n');
-    
-    StaticJsonDocument<200> doc; 
+
+    StaticJsonDocument<200> doc;
     DeserializationError error = deserializeJson(doc, incomingCommand);
 
     if (!error) {
       String action = doc["action"];
-      
+
       // Extract commanded variables
-      setSpeedPWM = doc["speed"] | 0; 
+      setSpeedPWM = doc["speed"] | 0;
       setTargetDepthCm = doc["targetDepth"] | 0.0;
 
       // Execute movement if there are no faults blocking that direction
       if (action == "hoist" && !topFault) {
-        analogWrite(ENA_PIN, setSpeedPWM); 
+        analogWrite(ENA_PIN, setSpeedPWM);
         hoistMotor();
-      } 
-      else if (action == "lower" && !botFault) {
-        analogWrite(ENA_PIN, setSpeedPWM); 
+      } else if (action == "lower" && !botFault) {
+        analogWrite(ENA_PIN, setSpeedPWM);
         lowerMotor();
-      } 
-      else if (action == "stop" || action == "estop") {
+      } else if (action == "stop" || action == "estop") {
         stopMotor();
-      }
-      else if (action == "fault_state") {
+      } else if (action == "fault_state") {
         softwareFault = doc["state"].as<bool>();
+      } else if (action == "calibrate") {
+        float calibDepthCm = doc["depth"] | 0.0;
+        noInterrupts();
+        depthPulses = calibDepthCm / CM_PER_PULSE;
+        interrupts();
       }
     }
   }
@@ -151,13 +155,19 @@ void loop() {
   // Blast the dual-data JSON payload up the USB cable every 100ms
   if (currentTime - lastTelemetryTime > 100) {
     lastTelemetryTime = currentTime;
-    
-    Serial.print("{\"setSpeedPWM\":"); Serial.print(setSpeedPWM);
-    Serial.print(",\"setTargetDepth\":"); Serial.print(setTargetDepthCm);
-    Serial.print(",\"measSpeedCmS\":"); Serial.print(measuredSpeedCmS, 2);
-    Serial.print(",\"measDepthCm\":"); Serial.print(measuredDepthCm, 2);
-    Serial.print(",\"topFault\":"); Serial.print(topFault ? "true" : "false");
-    Serial.print(",\"botFault\":"); Serial.print(botFault ? "true" : "false");
+
+    Serial.print("{\"setSpeedPWM\":");
+    Serial.print(setSpeedPWM);
+    Serial.print(",\"setTargetDepth\":");
+    Serial.print(setTargetDepthCm);
+    Serial.print(",\"measSpeedCmS\":");
+    Serial.print(measuredSpeedCmS, 2);
+    Serial.print(",\"measDepthCm\":");
+    Serial.print(measuredDepthCm, 2);
+    Serial.print(",\"topFault\":");
+    Serial.print(topFault ? "true" : "false");
+    Serial.print(",\"botFault\":");
+    Serial.print(botFault ? "true" : "false");
     Serial.println("}");
   }
 }
@@ -187,27 +197,24 @@ void triggerAlarm() {
   tone(BUZZER, 1500); // Continuous tone until stopped
 }
 
-void stopAlarm() {
-  noTone(BUZZER);
-}
+void stopAlarm() { noTone(BUZZER); }
 
 // --- INTERRUPT SERVICE ROUTINE ---
 // Triggers instantly when the LM393 sensor detects a slot
 void countPulse() {
   // 1. TRUE INDEPENDENT MEASUREMENT: Always track physical movement
-  absolutePulses++; 
+  absolutePulses++;
 
-  // 2. DIRECTIONAL ESTIMATION: 
+  // 2. DIRECTIONAL ESTIMATION:
   if (motorState == "HOIST") {
-    depthPulses--; 
-    if (depthPulses < 0) depthPulses = 0; 
-  } 
-  else if (motorState == "LOWER") {
+    depthPulses--;
+    if (depthPulses < 0)
+      depthPulses = 0;
+  } else if (motorState == "LOWER") {
     depthPulses++;
-  } 
-  else {
+  } else {
     // If the motor is IDLE but the disk is spinning, the rope is slipping!
     // Gravity dictates a slip usually means the cage is falling down.
-    depthPulses++; 
+    depthPulses++;
   }
 }
