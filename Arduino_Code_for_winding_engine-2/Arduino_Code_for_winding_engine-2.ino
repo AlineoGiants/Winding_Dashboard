@@ -5,8 +5,7 @@
 #include <ArduinoJson.h>
 
 // --- 1. HARDWARE PIN DEFINITIONS ---
-const int ENCODER_PIN =
-    2;                    // LM393 D0 Pin (MUST be Pin 2 for Hardware Interrupt)
+const int ENCODER_PIN = 2;                    // LM393 D0 Pin (MUST be Pin 2 for Hardware Interrupt)
 const int TOP_SENSOR = 4; // Top limit switch
 const int BOT_SENSOR = 5; // Bottom limit switch
 const int BUZZER = 6;     // Active buzzer for alarms
